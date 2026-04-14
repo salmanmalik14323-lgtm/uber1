@@ -1,9 +1,9 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:go_router/go_router.dart';
 import 'package:latlong2/latlong.dart';
+import 'package:location/location.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -30,6 +30,7 @@ class _HomeMapScreenState extends State<HomeMapScreen> {
   LatLng? _pendingCameraTarget;
   double _pendingZoom = 14;
   final _destinationController = TextEditingController();
+  late final Location _location = Location();
 
   @override
   void initState() {
@@ -48,119 +49,91 @@ class _HomeMapScreenState extends State<HomeMapScreen> {
     super.dispose();
   }
 
-  /// Geolocator handles web + mobile. Do not use [permission_handler] for
-  /// location on web — it often never completes, leaving [pickup] null.
-  Future<bool> _ensureGeolocatorPermission() async {
-    var permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
-    if (permission == LocationPermission.denied) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              kIsWeb
-                  ? 'Click the lock/info icon in the address bar and allow location, or use search.'
-                  : 'Location permission denied. Use search or enable GPS in settings.',
-            ),
-          ),
-        );
+  Future<bool> _ensureLocationPermission() async {
+    bool serviceEnabled = await _location.serviceEnabled();
+    if (!serviceEnabled) {
+      serviceEnabled = await _location.requestService();
+      if (!serviceEnabled) {
+        _showLocationError('Turn on location services.');
+        return false;
       }
-      return false;
     }
-    if (permission == LocationPermission.deniedForever) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(
-              'Location is blocked for this site. Enable it in browser or app settings.',
-            ),
-          ),
-        );
+
+    PermissionStatus permission = await _location.hasPermission();
+    if (permission == PermissionStatus.denied) {
+      permission = await _location.requestPermission();
+      if (permission == PermissionStatus.denied) {
+        _showLocationError(kIsWeb
+            ? 'Click lock/info in address bar to allow location, or use search.'
+            : 'Location permission denied. Enable GPS.');
+        return false;
       }
+    }
+
+    if (permission == PermissionStatus.deniedForever) {
+      _showLocationError('Location blocked. Enable in settings.');
       return false;
     }
     return true;
   }
 
+  void _showLocationError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
+  }
+
   void _setFallbackPickup(RideController ride, {String? message}) {
     ride.setPickup(
       _kFallback,
-      message ??
-          'Allow location when prompted, or search “Where to?” and press →',
+      message ?? 'Allow location or search "Where to?" and press →',
     );
     _moveTo(_kFallback, zoom: _kFallbackZoom);
   }
 
-  Future<void> _applyPickupFromPosition(
-    Position pos,
+  Future<void> _applyPickupFromLocationData(
+    LocationData locData,
     RideController ride,
   ) async {
-    final latLng = LatLng(pos.latitude, pos.longitude);
-    // Set coordinates immediately so [canBookRide] works; refine address after.
+    final latLng = LatLng(locData.latitude!, locData.longitude!);
     ride.setPickup(
       latLng,
-      'Current location (${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)})',
+      'Current location (${locData.latitude!.toStringAsFixed(4)}, ${locData.longitude!.toStringAsFixed(4)})',
     );
     await _moveTo(latLng, zoom: 14);
 
     try {
-      final rev = await reverseLabel(pos.latitude, pos.longitude).timeout(
+      final rev = await reverseLabel(locData.latitude!, locData.longitude!).timeout(
         const Duration(seconds: 10),
       );
       if (rev != null && rev.isNotEmpty && mounted) {
         ride.setPickup(latLng, rev);
       }
     } catch (_) {
-      // Keep coordinate fallback label
+      // Keep coordinate fallback
     }
   }
 
   Future<void> _loadInitialLocation(RideController ride) async {
-    // Web: permission_handler never finishing left pickup null → Continue stayed disabled.
     if (ride.pickup == null) {
       _setFallbackPickup(ride, message: 'Getting your location…');
     }
 
-    final ok = await _ensureGeolocatorPermission();
+    final ok = await _ensureLocationPermission();
     if (!ok) {
       _setFallbackPickup(ride);
       return;
     }
 
-    if (!kIsWeb) {
-      final serviceOn = await Geolocator.isLocationServiceEnabled();
-      if (!serviceOn) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Turn on device location services.')),
-          );
-        }
-        _setFallbackPickup(ride);
-        return;
-      }
-    }
-
     try {
-      final pos = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 12),
-        ),
-      );
-      await _applyPickupFromPosition(pos, ride);
+      final locData = await _location.getLocation();
+      await _applyPickupFromLocationData(locData, ride);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              kIsWeb
-                  ? 'Could not read GPS ($e). Use search or allow location.'
-                  : 'Could not get GPS: $e',
-            ),
-          ),
-        );
+        _showLocationError(kIsWeb
+            ? 'Could not read GPS ($e). Use search or allow location.'
+            : 'Could not get GPS: $e');
       }
       _setFallbackPickup(ride);
     }
@@ -190,9 +163,7 @@ class _HomeMapScreenState extends State<HomeMapScreen> {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text(
-                'No place found. Try a fuller name (e.g. city + country).',
-              ),
+              content: Text('No place found. Try city + country.'),
             ),
           );
         }
@@ -201,24 +172,12 @@ class _HomeMapScreenState extends State<HomeMapScreen> {
       final latLng = hit.latLng;
       ride.setDestination(latLng, hit.formattedAddress);
 
-      if (ride.pickup == null) {
-        _setFallbackPickup(ride);
-      }
-
       final pickup = ride.pickup;
       if (pickup != null) {
-        var south = pickup.latitude < latLng.latitude
-            ? pickup.latitude
-            : latLng.latitude;
-        var north = pickup.latitude > latLng.latitude
-            ? pickup.latitude
-            : latLng.latitude;
-        var west = pickup.longitude < latLng.longitude
-            ? pickup.longitude
-            : latLng.longitude;
-        var east = pickup.longitude > latLng.longitude
-            ? pickup.longitude
-            : latLng.longitude;
+        var south = pickup.latitude < latLng.latitude ? pickup.latitude : latLng.latitude;
+        var north = pickup.latitude > latLng.latitude ? pickup.latitude : latLng.latitude;
+        var west = pickup.longitude < latLng.longitude ? pickup.longitude : latLng.longitude;
+        var east = pickup.longitude > latLng.longitude ? pickup.longitude : latLng.longitude;
         const pad = 0.015;
         if ((north - south).abs() < 0.003) {
           south -= pad;
@@ -234,12 +193,7 @@ class _HomeMapScreenState extends State<HomeMapScreen> {
           _mapController.fitCamera(
             CameraFit.bounds(
               bounds: bounds,
-              padding: const EdgeInsets.only(
-                top: 140,
-                left: 48,
-                right: 48,
-                bottom: 200,
-              ),
+              padding: const EdgeInsets.only(top: 140, left: 48, right: 48, bottom: 200),
             ),
           );
         });
@@ -256,34 +210,15 @@ class _HomeMapScreenState extends State<HomeMapScreen> {
   }
 
   Future<void> _recenterGps(RideController ride) async {
-    final ok = await _ensureGeolocatorPermission();
+    final ok = await _ensureLocationPermission();
     if (!ok) return;
 
-    if (!kIsWeb) {
-      final serviceOn = await Geolocator.isLocationServiceEnabled();
-      if (!serviceOn) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Turn on device location services.')),
-          );
-        }
-        return;
-      }
-    }
-
     try {
-      final pos = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-          timeLimit: Duration(seconds: 12),
-        ),
-      );
-      await _applyPickupFromPosition(pos, ride);
+      final locData = await _location.getLocation();
+      await _applyPickupFromLocationData(locData, ride);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not get GPS: $e')),
-        );
+        _showLocationError('Could not get GPS: $e');
       }
     }
   }
@@ -400,8 +335,7 @@ class _HomeMapScreenState extends State<HomeMapScreen> {
                       controller: _destinationController,
                       decoration: InputDecoration(
                         labelText: 'Where to?',
-                        hintText:
-                            'Search any city, landmark, or address worldwide',
+                        hintText: 'Search any city, landmark, or address worldwide',
                         border: InputBorder.none,
                         contentPadding: const EdgeInsets.symmetric(
                           horizontal: 16,
